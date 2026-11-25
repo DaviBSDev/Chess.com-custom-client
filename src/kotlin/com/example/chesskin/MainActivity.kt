@@ -1,0 +1,198 @@
+package com.example.chesskin
+
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
+import java.io.File
+
+/**
+ * Abre o chess.com num WebView e troca APENAS as imagens das peças.
+ *
+ * Pastas procuradas (na ordem), visíveis ou ocultas, em /sdcard e em /sdcard/Pictures:
+ *   .ChessSkin   ChessSkin
+ * Nomes: wp wn wb wr wq wk (brancas) e bp bn bb br bq bk (pretas),
+ * com extensão .png, .webp, .jpg ou .jpeg  (ex.: wp.png ou .wp.png, oculto).
+ *
+ * Para ler pastas ocultas o app precisa de "Acesso a todos os arquivos" (Android 11+);
+ * ele abre a tela de permissão na primeira vez.
+ *
+ * Arquivo ausente, vazio ou inválido => o site usa a imagem padrão dele.
+ */
+class MainActivity : Activity() {
+    private lateinit var web: WebView
+    private val pieceRe = Regex("/pieces/[^/]+/\\d+/([wb][pnbrqk])\\.(png|svg|webp)")
+    private val exts = listOf("png", "webp", "jpg", "jpeg")
+    private val codes = listOf("wp", "wn", "wb", "wr", "wq", "wk", "bp", "bn", "bb", "br", "bq", "bk")
+
+    private var started = false
+    private var waiting = false // esperando o usuário voltar da tela de permissão
+    private var left = false
+
+    // cache: lê e valida cada imagem uma vez (refaz só se os arquivos mudarem)
+    private class Skin(val bytes: ByteArray?, val mime: String, val sig: String)
+    private val cache = java.util.concurrent.ConcurrentHashMap<String, Skin>()
+
+    private val pics: File
+        get() = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+
+    @Suppress("DEPRECATION")
+    private val root: File
+        get() = Environment.getExternalStorageDirectory()
+
+    private val dirs: List<File>
+        get() = listOf(
+            File(root, ".ChessSkin"), File(pics, ".ChessSkin"),
+            File(root, "ChessSkin"), File(pics, "ChessSkin")
+        )
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        web = RcWebView(this)
+        setContentView(web)
+        web.settings.javaScriptEnabled = true
+        web.settings.domStorageEnabled = true
+        web.settings.cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+        web.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null)
+        // toque longo não abre menu nem vibra: todo toque simples é clique esquerdo
+        web.isLongClickable = false
+        web.setOnLongClickListener { true }
+        web.isHapticFeedbackEnabled = false
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+
+        web.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(
+                view: WebView, request: WebResourceRequest
+            ): WebResourceResponse? {
+                val m = pieceRe.find(request.url.toString()) ?: return null
+                return try { skinResponse(m.groupValues[1]) } catch (_: Exception) { null }
+            }
+        }
+
+        if (Build.VERSION.SDK_INT >= 30) {
+            if (Environment.isExternalStorageManager()) start() else askAllFiles()
+        } else if (Build.VERSION.SDK_INT >= 23 &&
+            checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE), 1)
+        } else {
+            start()
+        }
+    }
+
+    /** Abre a tela "Acesso a todos os arquivos" deste app. */
+    private fun askAllFiles() {
+        waiting = true
+        try {
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + packageName))
+            )
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            } catch (_: Exception) {
+                waiting = false
+                start()
+            }
+        }
+    }
+
+    override fun onPause() {
+        left = true
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // voltou da tela de permissão (concedida ou não): segue; sem permissão usa as peças padrão
+        if (waiting && left) {
+            waiting = false
+            left = false
+            start()
+        }
+    }
+
+    override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
+        // negado = tudo continua funcionando, só com as peças padrão
+        start()
+    }
+
+    private fun start() {
+        if (started) return
+        started = true
+        // se nenhuma pasta existe, cria a oculta (não aparece na galeria)
+        try { if (dirs.none { it.isDirectory }) File(root, ".ChessSkin").mkdirs() } catch (_: Exception) {}
+        val dir = dirs.firstOrNull { it.isDirectory } ?: File(root, ".ChessSkin")
+        val ok = codes.count { loadSkin(it).bytes != null }
+        Toast.makeText(this, "Peças em: " + dir.path + " (" + ok + "/12 válidas)", Toast.LENGTH_LONG).show()
+        web.loadUrl("https://www.chess.com")
+    }
+
+    /** Devolve a imagem do usuário para a peça, ou null (= usar a original do site). */
+    private fun skinResponse(piece: String): WebResourceResponse? {
+        val skin = loadSkin(piece)
+        val bytes = skin.bytes ?: return null
+        val r = WebResourceResponse(skin.mime, null, java.io.ByteArrayInputStream(bytes))
+        r.responseHeaders = mapOf("Access-Control-Allow-Origin" to "*")
+        return r
+    }
+
+    /** Arquivos candidatos da peça em todas as pastas (visíveis e ocultas). */
+    private fun candidates(piece: String): List<File> {
+        val out = ArrayList<File>()
+        for (d in dirs) {
+            if (!d.isDirectory) continue
+            for (n in listOf(piece, "." + piece)) {
+                for (ext in exts) {
+                    val f = File(d, n + "." + ext)
+                    if (f.isFile) out.add(f)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun loadSkin(piece: String): Skin {
+        val files = candidates(piece)
+        val sig = files.joinToString("|") { it.path + ":" + it.lastModified() + ":" + it.length() }
+        val old = cache[piece]
+        if (old != null && old.sig == sig) return old
+
+        var skin = Skin(null, "", sig)
+        for (f in files) {
+            if (f.length() == 0L) continue
+            try {
+                val data = f.readBytes()
+                val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(data, 0, data.size, o)
+                if (o.outWidth > 0 && o.outHeight > 0) { // imagem válida: usa a primeira boa
+                    val mime = when (f.extension.lowercase()) {
+                        "png" -> "image/png"; "webp" -> "image/webp"; else -> "image/jpeg"
+                    }
+                    skin = Skin(data, mime, sig)
+                    break
+                }
+            } catch (_: Exception) {}
+        }
+        cache[piece] = skin
+        return skin
+    }
+
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        if (web.canGoBack()) web.goBack() else super.onBackPressed()
+    }
+}

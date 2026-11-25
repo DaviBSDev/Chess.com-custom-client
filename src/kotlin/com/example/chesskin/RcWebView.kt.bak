@@ -1,0 +1,92 @@
+package com.example.chesskin
+
+import android.content.Context
+import android.view.InputDevice
+import android.view.MotionEvent
+import android.webkit.WebView
+
+/**
+ * WebView com "clique direito" por gesto:
+ * segure um dedo na tela e use o OUTRO dedo = botão direito do mouse
+ * (toque e arraste com o 2º dedo para desenhar setas/marcar casas no tabuleiro).
+ * O dedo que está segurando é ignorado enquanto o gesto durar.
+ */
+class RcWebView(context: Context) : WebView(context) {
+    private var rc = false          // 2º dedo em modo botão direito
+    private var rcId = -1           // id do ponteiro do 2º dedo
+    private var ignoreRest = false  // ignora o resto do gesto (até soltar tudo)
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> { rc = false; ignoreRest = false; rcId = -1 }
+
+            MotionEvent.ACTION_POINTER_DOWN -> if (!ignoreRest && e.pointerCount == 2) {
+                // cancela o toque normal do 1º dedo na página
+                val c = MotionEvent.obtain(e)
+                c.action = MotionEvent.ACTION_CANCEL
+                super.onTouchEvent(c)
+                c.recycle()
+                rc = true
+                ignoreRest = true
+                rcId = e.getPointerId(e.actionIndex)
+                sendMouse(e, e.actionIndex, MotionEvent.ACTION_DOWN)
+                return true
+            }
+
+            MotionEvent.ACTION_MOVE -> if (rc) {
+                val i = e.findPointerIndex(rcId)
+                if (i >= 0) sendMouse(e, i, MotionEvent.ACTION_MOVE)
+                return true
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> if (ignoreRest) {
+                if (rc && e.getPointerId(e.actionIndex) == rcId) {
+                    sendMouse(e, e.actionIndex, MotionEvent.ACTION_UP)
+                    rc = false
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (ignoreRest) {
+                if (rc) {
+                    val i = e.findPointerIndex(rcId).let { if (it >= 0) it else 0 }
+                    sendMouse(e, i, MotionEvent.ACTION_UP)
+                }
+                rc = false
+                ignoreRest = false
+                rcId = -1
+                return true
+            }
+        }
+        if (ignoreRest) return true
+        return super.onTouchEvent(e)
+    }
+
+    /** Envia ao WebView um evento de mouse com o botão direito, na posição do ponteiro [idx]. */
+    private fun sendMouse(src: MotionEvent, idx: Int, action: Int) {
+        val props = arrayOf(MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = MotionEvent.TOOL_TYPE_MOUSE
+        })
+        val coords = arrayOf(MotionEvent.PointerCoords().apply {
+            x = src.getX(idx)
+            y = src.getY(idx)
+            pressure = 1f
+            size = 1f
+        })
+        val buttons = if (action == MotionEvent.ACTION_UP) 0 else MotionEvent.BUTTON_SECONDARY
+        val ev = MotionEvent.obtain(
+            src.downTime, src.eventTime, action, 1, props, coords,
+            0, buttons, 1f, 1f, src.deviceId, 0, InputDevice.SOURCE_MOUSE, 0
+        )
+        if (action != MotionEvent.ACTION_MOVE) {
+            // actionButton não tem setter público; tenta por reflexão (se falhar, buttonState basta)
+            try {
+                MotionEvent::class.java.getMethod("setActionButton", Int::class.javaPrimitiveType)
+                    .invoke(ev, MotionEvent.BUTTON_SECONDARY)
+            } catch (_: Throwable) {}
+        }
+        super.onTouchEvent(ev)
+        ev.recycle()
+    }
+}

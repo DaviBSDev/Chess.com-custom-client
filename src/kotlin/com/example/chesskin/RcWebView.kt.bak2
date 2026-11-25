@@ -1,0 +1,91 @@
+package com.example.chesskin
+
+import android.content.Context
+import android.view.MotionEvent
+import android.webkit.WebView
+
+/**
+ * WebView com "clique direito" por gesto:
+ * segure um dedo na tela e use o OUTRO dedo = botão direito do mouse
+ * (toque e arraste com o 2º dedo para desenhar setas/marcar casas no tabuleiro).
+ * O dedo que está segurando é ignorado enquanto o gesto durar.
+ *
+ * O botão direito é simulado dentro da página (eventos de mouse via JavaScript).
+ */
+class RcWebView(context: Context) : WebView(context) {
+    private var rc = false          // 2º dedo em modo botão direito
+    private var rcId = -1           // id do ponteiro do 2º dedo
+    private var ignoreRest = false  // ignora o resto do gesto (até soltar tudo)
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> { rc = false; ignoreRest = false; rcId = -1 }
+
+            MotionEvent.ACTION_POINTER_DOWN -> if (!ignoreRest && e.pointerCount == 2) {
+                // cancela o toque normal do 1º dedo na página
+                val c = MotionEvent.obtain(e)
+                c.action = MotionEvent.ACTION_CANCEL
+                super.onTouchEvent(c)
+                c.recycle()
+                rc = true
+                ignoreRest = true
+                rcId = e.getPointerId(e.actionIndex)
+                rcEvent(e, e.actionIndex, "down")
+                return true
+            }
+
+            MotionEvent.ACTION_MOVE -> if (rc) {
+                val i = e.findPointerIndex(rcId)
+                if (i >= 0) rcEvent(e, i, "move")
+                return true
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> if (ignoreRest) {
+                if (rc && e.getPointerId(e.actionIndex) == rcId) {
+                    rcEvent(e, e.actionIndex, "up")
+                    rc = false
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (ignoreRest) {
+                if (rc) {
+                    val i = e.findPointerIndex(rcId).let { if (it >= 0) it else 0 }
+                    rcEvent(e, i, "up")
+                }
+                rc = false
+                ignoreRest = false
+                rcId = -1
+                return true
+            }
+        }
+        if (ignoreRest) return true
+        return super.onTouchEvent(e)
+    }
+
+    /** Dispara na página um evento de mouse (botão direito) na posição do ponteiro [idx]. */
+    private fun rcEvent(src: MotionEvent, idx: Int, type: String) {
+        val x = src.getX(idx)
+        val y = src.getY(idx)
+        evaluateJavascript("(" + RC_JS + ")('" + type + "'," + x + "," + y + ")", null)
+    }
+}
+
+// x e y chegam em pixels da tela; a página usa pixels CSS (divide por devicePixelRatio)
+private val RC_JS = """
+function(t, x, y) {
+  var d = window.devicePixelRatio || 1, cx = x / d, cy = y / d;
+  var el = document.elementFromPoint(cx, cy) || document.body;
+  function fire(type, isPtr, btns) {
+    var C = isPtr ? (window.PointerEvent || MouseEvent) : MouseEvent;
+    var o = {bubbles: true, cancelable: true, composed: true, view: window,
+             clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+             button: 2, buttons: btns, detail: 1};
+    if (isPtr) { o.pointerId = 1; o.pointerType = 'mouse'; o.isPrimary = true; }
+    el.dispatchEvent(new C(type, o));
+  }
+  if (t === 'down') { fire('pointerdown', true, 2); fire('mousedown', false, 2); }
+  else if (t === 'move') { fire('pointermove', true, 2); fire('mousemove', false, 2); }
+  else { fire('pointerup', true, 0); fire('mouseup', false, 0); fire('contextmenu', false, 0); }
+}
+"""

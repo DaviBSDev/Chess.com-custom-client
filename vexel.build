@@ -1,0 +1,12 @@
+[app]
+name = "Chess.com"
+package = "com.example.chesskin"
+version_code = 1
+version_name = 1.0
+
+[sdk]
+min = 24
+target = 33
+
+[ndk]
+enabled = false

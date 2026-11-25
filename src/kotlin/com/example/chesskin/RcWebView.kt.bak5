@@ -1,0 +1,185 @@
+package com.example.chesskin
+
+import android.content.Context
+import android.view.MotionEvent
+import android.view.ViewConfiguration
+import android.webkit.WebView
+import kotlin.math.abs
+
+/**
+ * WebView com:
+ *  1) "clique direito" por gesto: segure um dedo e use o OUTRO = botão direito
+ *     (toque/arraste com o 2º dedo desenha setas e marca casas).
+ *  2) Proteção das setas: o toque do 1º dedo é decidido pelo que há embaixo dele:
+ *     - sobre uma PEÇA: vai direto à página (segurar/arrastar a peça apaga as setas);
+ *     - sobre o TABULEIRO (casa sem peça): toque simples é ignorado; dois toques
+ *       rápidos passam (e apagam as setas);
+ *     - fora do tabuleiro (menus, botões): comportamento normal.
+ */
+class RcWebView(context: Context) : WebView(context) {
+    private var rc = false          // 2º dedo em modo botão direito
+    private var rcId = -1           // id do ponteiro do 2º dedo
+    private var ignoreRest = false  // ignora o resto do gesto (até soltar tudo)
+    private var pending: MotionEvent? = null  // DOWN do 1º dedo ainda não enviado
+    private var kind: String? = null          // "piece", "board", "other" (null = ainda não sei)
+    private var gen = 0                       // número do gesto atual
+    private var lastTap = 0L
+    private var lastX = 0f
+    private var lastY = 0f
+    private val slop = ViewConfiguration.get(context).scaledTouchSlop
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                clearPending()
+                rc = false
+                ignoreRest = false
+                rcId = -1
+                kind = null
+                gen++
+                pending = MotionEvent.obtain(e)
+                classify(e.x, e.y, gen)
+                return true
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> if (!rc && e.pointerCount == 2) {
+                if (!ignoreRest) {
+                    if (pending != null) {
+                        clearPending() // o 1º dedo nunca chegou à página
+                    } else {
+                        // o 1º dedo já estava na página: cancela o toque dele
+                        val c = MotionEvent.obtain(e)
+                        c.action = MotionEvent.ACTION_CANCEL
+                        super.onTouchEvent(c)
+                        c.recycle()
+                    }
+                }
+                rc = true
+                ignoreRest = true
+                rcId = e.getPointerId(e.actionIndex)
+                rcEvent(e, e.actionIndex, "down")
+                return true
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (rc) {
+                    val i = e.findPointerIndex(rcId)
+                    if (i >= 0) rcEvent(e, i, "move")
+                    return true
+                }
+                val p = pending
+                if (p != null) {
+                    if (abs(e.x - p.x) > slop || abs(e.y - p.y) > slop) flushPending()
+                    else return true
+                }
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> if (ignoreRest) {
+                if (rc && e.getPointerId(e.actionIndex) == rcId) {
+                    rcEvent(e, e.actionIndex, "up")
+                    rc = false
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (ignoreRest) {
+                    if (rc) {
+                        val i = e.findPointerIndex(rcId).let { if (it >= 0) it else 0 }
+                        rcEvent(e, i, "up")
+                    }
+                    rc = false
+                    ignoreRest = false
+                    rcId = -1
+                    return true
+                }
+                if (pending != null) {
+                    if (e.actionMasked == MotionEvent.ACTION_UP) {
+                        if (kind == "board") {
+                            val close = abs(e.x - lastX) < slop * 4 && abs(e.y - lastY) < slop * 4
+                            if (e.eventTime - lastTap < 300 && close) {
+                                lastTap = 0L
+                                flushPending() // dois toques rápidos: deixa passar
+                            } else {
+                                lastTap = e.eventTime
+                                lastX = e.x
+                                lastY = e.y
+                                clearPending() // toque simples no tabuleiro: ignora
+                                return true
+                            }
+                        } else {
+                            flushPending() // fora do tabuleiro (ou ainda indefinido): normal
+                        }
+                    } else {
+                        clearPending()
+                        return true
+                    }
+                }
+            }
+        }
+        if (ignoreRest) return true
+        return super.onTouchEvent(e)
+    }
+
+    /** Descobre o que está sob o dedo; se for uma peça, envia o toque na hora. */
+    private fun classify(x: Float, y: Float, id: Int) {
+        evaluateJavascript("(" + KIND_JS + ")(" + x + "," + y + ")") { r ->
+            if (id == gen && pending != null && !rc && !ignoreRest) {
+                val s = r ?: ""
+                kind = if (s.contains("piece")) "piece" else if (s.contains("board")) "board" else "other"
+                if (kind == "piece") flushPending()
+            }
+        }
+    }
+
+    private fun flushPending() {
+        val p = pending ?: return
+        pending = null
+        super.onTouchEvent(p)
+        p.recycle()
+    }
+
+    private fun clearPending() {
+        pending?.recycle()
+        pending = null
+    }
+
+    /** Dispara na página um evento de mouse (botão direito) na posição do ponteiro [idx]. */
+    private fun rcEvent(src: MotionEvent, idx: Int, type: String) {
+        val x = src.getX(idx)
+        val y = src.getY(idx)
+        evaluateJavascript("(" + RC_JS + ")('" + type + "'," + x + "," + y + ")", null)
+    }
+}
+
+// Classifica o ponto: peça, tabuleiro ou outro. Se os nomes das classes do site
+// mudarem, ajuste os seletores abaixo ('.piece' e 'wc-chess-board,chess-board,.board').
+private val KIND_JS = """
+function(x, y) {
+  var d = window.devicePixelRatio || 1;
+  var el = document.elementFromPoint(x / d, y / d);
+  if (!el) return 'other';
+  if (el.closest('.piece')) return 'piece';
+  if (el.closest('wc-chess-board,chess-board,.board')) return 'board';
+  return 'other';
+}
+"""
+
+// x e y chegam em pixels da tela; a página usa pixels CSS (divide por devicePixelRatio)
+private val RC_JS = """
+function(t, x, y) {
+  var d = window.devicePixelRatio || 1, cx = x / d, cy = y / d;
+  var el = document.elementFromPoint(cx, cy) || document.body;
+  function fire(type, isPtr, btns) {
+    var C = isPtr ? (window.PointerEvent || MouseEvent) : MouseEvent;
+    var o = {bubbles: true, cancelable: true, composed: true, view: window,
+             clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+             button: 2, buttons: btns, detail: 1};
+    if (isPtr) { o.pointerId = 1; o.pointerType = 'mouse'; o.isPrimary = true; }
+    el.dispatchEvent(new C(type, o));
+  }
+  if (t === 'down') { fire('pointerdown', true, 2); fire('mousedown', false, 2); }
+  else if (t === 'move') { fire('pointermove', true, 2); fire('mousemove', false, 2); }
+  else { fire('pointerup', true, 0); fire('mouseup', false, 0); fire('contextmenu', false, 0); }
+}
+"""
