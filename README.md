@@ -21,3 +21,4 @@ Serve para desenhar setas e marcar casas no tabuleiro.
 Ícone: troque `src/res/mipmap-xxxhdpi/ic_launcher.png` (PNG 192x192) pelo que quiser.
 Nome do app: `android:label` no AndroidManifest.xml e `name` no vexel.build.
 # Chess.com-custom-client
+# Chess.com-custom-client
